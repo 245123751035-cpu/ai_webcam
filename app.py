@@ -3,6 +3,7 @@ import numpy as np
 import urllib.request
 import os
 import time
+import gc
 import gradio as gr
 import torch
 
@@ -81,7 +82,7 @@ def process_frame(frame, gallery_history, last_snap_time):
         violations = []
 
         # YOLO Object Detection (small input size keeps memory and CPU low)
-        results = yolo_model.predict(frame, classes=[PERSON_CLASS, PHONE_CLASS], imgsz=320, conf=0.4, device="cpu", verbose=False)
+        results = yolo_model.predict(frame, classes=[PERSON_CLASS, PHONE_CLASS], imgsz=256, conf=0.4, device="cpu", verbose=False)
         person_count, phone_count = 0, 0
 
         for box in results[0].boxes:
@@ -94,6 +95,9 @@ def process_frame(frame, gallery_history, last_snap_time):
             elif cls_id == PHONE_CLASS:
                 phone_count += 1
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+        del results
+        gc.collect()
 
         if person_count == 0: violations.append("NO PERSON DETECTED")
         elif person_count > 1: violations.append(f"MULTIPLE PERSONS ({person_count})")
@@ -165,7 +169,8 @@ with gr.Blocks(theme=custom_theme, title="AI Exam Proctor") as app:
     input_cam.stream(
         fn=process_frame,
         inputs=[input_cam, gallery_state, last_snap_state],
-        outputs=[output_cam, alert_box, evidence_gallery, gallery_state, last_snap_state]
+        outputs=[output_cam, alert_box, evidence_gallery, gallery_state, last_snap_state],
+        concurrency_limit=1
     )
 
 if __name__ == "__main__":
