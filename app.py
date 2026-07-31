@@ -4,6 +4,14 @@ import urllib.request
 import os
 import time
 import gradio as gr
+import torch
+
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
+
 from ultralytics import YOLO
 import mediapipe as mp
 
@@ -24,7 +32,7 @@ VisionRunningMode = mp.tasks.vision.RunningMode
 
 options = FaceLandmarkerOptions(
     base_options=BaseOptions(model_asset_path=model_path),
-    running_mode=VisionRunningMode.IMAGE, 
+    running_mode=VisionRunningMode.IMAGE,
     num_faces=1,
     min_face_detection_confidence=0.5,
     min_tracking_confidence=0.5
@@ -32,17 +40,21 @@ options = FaceLandmarkerOptions(
 landmarker = FaceLandmarker.create_from_options(options)
 LEFT_EYE_INNER, LEFT_EYE_OUTER, LEFT_IRIS_CENTER = 133, 33, 468
 
+# Throttle heavy AI inference so the small free-tier instance does not OOM.
+PROCESS_INTERVAL = 0.7
+_last_result = {"time": 0.0, "frame": None, "alert": None}
+
 def get_gaze_direction(landmarks, img_w, img_h):
     inner = np.array([landmarks[LEFT_EYE_INNER].x * img_w, landmarks[LEFT_EYE_INNER].y * img_h])
     outer = np.array([landmarks[LEFT_EYE_OUTER].x * img_w, landmarks[LEFT_EYE_OUTER].y * img_h])
     iris = np.array([landmarks[LEFT_IRIS_CENTER].x * img_w, landmarks[LEFT_IRIS_CENTER].y * img_h])
-    
+
     eye_width = np.linalg.norm(inner - outer)
     iris_dist = np.linalg.norm(iris - outer)
-    
+
     if eye_width == 0: return "Unknown"
     ratio = iris_dist / eye_width
-    
+
     if ratio < 0.42: return "Looking Right"
     elif ratio > 0.58: return "Looking Left"
     else: return "Looking Center"
@@ -50,28 +62,32 @@ def get_gaze_direction(landmarks, img_w, img_h):
 # --- 3. The Core Processing Function ---
 def process_frame(frame, gallery_history, last_snap_time):
     try:
-        if frame is None: 
+        if frame is None:
             return frame, "Waiting for camera...", gallery_history, gallery_history, last_snap_time
-            
+
+        now = time.time()
+        if now - _last_result["time"] < PROCESS_INTERVAL and _last_result["frame"] is not None:
+            return _last_result["frame"], _last_result["alert"], gallery_history, gallery_history, last_snap_time
+
         # FIX: Force a writable copy of the image so OpenCV can draw on it
         frame = frame.copy()
-            
+
         # FIX: Strip RGBA alpha channel if it exists (MediaPipe requires exactly 3 channels)
         if frame.shape[2] == 4:
             frame = frame[:, :, :3]
-            
-        frame = np.ascontiguousarray(frame) 
+
+        frame = np.ascontiguousarray(frame)
         img_h, img_w = frame.shape[:2]
         violations = []
-        
-        # YOLO Object Detection
-        results = yolo_model.predict(frame, classes=[PERSON_CLASS, PHONE_CLASS], verbose=False)
+
+        # YOLO Object Detection (small input size keeps memory and CPU low)
+        results = yolo_model.predict(frame, classes=[PERSON_CLASS, PHONE_CLASS], imgsz=320, conf=0.4, device="cpu", verbose=False)
         person_count, phone_count = 0, 0
-        
+
         for box in results[0].boxes:
             cls_id = int(box.cls[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            
+
             if cls_id == PERSON_CLASS:
                 person_count += 1
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -87,7 +103,7 @@ def process_frame(frame, gallery_history, last_snap_time):
         if person_count == 1:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
             face_result = landmarker.detect(mp_image)
-            
+
             if face_result.face_landmarks:
                 landmarks = face_result.face_landmarks[0]
                 gaze = get_gaze_direction(landmarks, img_w, img_h)
@@ -101,21 +117,25 @@ def process_frame(frame, gallery_history, last_snap_time):
         if violations:
             violation_text = " | ".join(violations)
             alert_html = f"<div style='background-color: #f8d7da; padding: 15px; border-radius: 5px; color: #721c24; font-size: 18px;'><b>🚨 VIOLATION DETECTED:</b> {violation_text}</div>"
-            
+
             y_pos = 70
             for v in violations:
                 cv2.putText(frame, f"FLAG: {v}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                 y_pos += 30
-                
+
             if current_time - last_snap_time > 3.0:
                 timestamp_str = time.strftime("%H:%M:%S")
                 evidence_frame = frame.copy()
                 cv2.putText(evidence_frame, f"Captured: {timestamp_str}", (10, img_h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
+
                 gallery_history.insert(0, evidence_frame)
-                if len(gallery_history) > 6: 
+                if len(gallery_history) > 6:
                     gallery_history.pop()
                 last_snap_time = current_time
+
+        _last_result["time"] = now
+        _last_result["frame"] = frame
+        _last_result["alert"] = alert_html
 
         return frame, alert_html, gallery_history, gallery_history, last_snap_time
 
@@ -132,19 +152,19 @@ with gr.Blocks(theme=custom_theme, title="AI Exam Proctor") as app:
 
     gr.Markdown("# 🛡️ Automated AI Exam Proctoring System")
     gr.Markdown("### Developed for maintaining academic integrity via real-time computer vision.")
-    
+
     alert_box = gr.HTML(value="<div style='background-color: #e2e3e5; padding: 15px; border-radius: 5px; color: #383d41; font-size: 18px;'>Waiting for camera feed...</div>")
 
     with gr.Row():
         input_cam = gr.Image(label="Student Webcam Feed", sources=["webcam"], streaming=True)
         output_cam = gr.Image(label="AI Monitoring View (Real-time Analysis)", interactive=False)
-        
+
     gr.Markdown("### 📸 Evidence Log (Captured Violations)")
     evidence_gallery = gr.Gallery(label="Violation Screenshots", show_label=False, elem_id="gallery", columns=3, rows=1, height="auto")
-        
+
     input_cam.stream(
-        fn=process_frame, 
-        inputs=[input_cam, gallery_state, last_snap_state], 
+        fn=process_frame,
+        inputs=[input_cam, gallery_state, last_snap_state],
         outputs=[output_cam, alert_box, evidence_gallery, gallery_state, last_snap_state]
     )
 
